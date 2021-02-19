@@ -5,35 +5,51 @@ use std::time::Duration;
 use anyhow::Result;
 use futures::future::FutureExt;
 use futures::prelude::*;
+use std::marker::PhantomData;
 
-pub struct Options<T, FUT, F>
+pub trait Fetcher<'a, T> {
+    type Output: Future<Output = Result<T>>;
+    fn call(&self, _: &'a str) -> Self::Output;
+}
+
+impl<'a, T, F, Fut> Fetcher<'a, T> for F
 where
     T: Send + Clone + PartialEq,
-    FUT: Future<Output = Result<T>> + Send,
+    F: Fn(&'a str) -> Fut,
+    Fut: Future<Output = Result<T>> + 'a,
+{
+    type Output = Fut;
+    fn call(&self, s: &'a str) -> Self::Output {
+        self(s)
+    }
+}
+
+pub struct Options<T, F>
+where
+    T: Send + Clone + PartialEq,
     // fetcher
-    F: for<'a> Fn(&'a str) -> FUT,
+    F: for<'a> Fetcher<'a, T>,
 {
     refresh_interval: Duration,
     enable_expire: bool,
     expire_duration: Duration,
 
     fetcher: F,
-
-    error_handler: Option<Box<dyn for<'b> Fn(&'b str, anyhow::Error) -> future::BoxFuture<'a, ()>>>,
-    change_handler: Option<Box<dyn for<'b> Fn(&'b str, T, T) -> future::BoxFuture<'a, ()>>>,
-    delete_handler: Option<Box<dyn for<'b> Fn(&'a str, T) -> future::BoxFuture<'a, ()>>>,
+    // error_handler: Option<Box<dyn for<'b> Fn(&'b str, anyhow::Error) -> future::BoxFuture<'a, ()>>>,
+    // change_handler: Option<Box<dyn for<'b> Fn(&'b str, T, T) -> future::BoxFuture<'a, ()>>>,
+    // delete_handler: Option<Box<dyn for<'b> Fn(&'a str, T) -> future::BoxFuture<'a, ()>>>,
+    phantom: PhantomData<T>,
 }
 
 async fn test_func(_: &str) -> Result<usize> {
     Ok(1)
 }
 
-impl<'a, T, FUT, F> Options<'a, T, FUT, F>
+impl<T, F> Options<T, F>
 where
     T: Send + Clone + PartialEq,
-    FUT: Future<Output = Result<T>> + Send + 'a,
     // fetcher
-    F: Fn(&'a str) -> FUT + 'a,
+    F: for<'a> Fetcher<'a, T>,
 {
     // pub fn new(
     //     refresh_interval: Duration,
@@ -41,15 +57,6 @@ where
     // ) -> Self {
     //     Self {}
     // }
-}
-
-fn error_wrapper<'a, FUT>(
-    f: impl Fn(&'a str, anyhow::Error) -> FUT + 'static,
-) -> Box<dyn Fn(&'a str, anyhow::Error) -> futures::future::BoxFuture<'a, ()>>
-where
-    FUT: Future<Output = ()> + Send + 'a,
-{
-    Box::new(move |s: &str, e: anyhow::Error| f(s, e).boxed())
 }
 
 // fn change_wrapper<'a, FUT, T>(
@@ -86,12 +93,14 @@ where
 async fn test_error(_: &str, e: anyhow::Error) {
     println!("{}", e);
 }
+
 #[cfg(test)]
 mod tests {
-    use crate::{error_wrapper, test_error, test_func, Options};
+    use crate::{test_error, test_func, Options};
     use anyhow::Result;
     use futures::future::BoxFuture;
     use futures::FutureExt;
+    use std::marker::PhantomData;
 
     #[tokio::test]
     async fn it_works() {
@@ -100,9 +109,10 @@ mod tests {
             enable_expire: false,
             expire_duration: Default::default(),
             fetcher: test_func,
-            error_handler: Some(error_wrapper(test_error)),
-            change_handler: None,
-            delete_handler: None,
+            // error_handler: Some(error_wrapper(test_error)),
+            // change_handler: None,
+            // delete_handler: None,
+            phantom: PhantomData,
         };
     }
 }
