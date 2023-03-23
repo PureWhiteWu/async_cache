@@ -1,3 +1,86 @@
+//! AsyncCache is a cache system that automatically updates and deletes entries using async fetchers.
+//!
+//! # Usage
+//!
+//! To use AsyncCache, you need to implement the `Fetcher` trait for the type you want to cache. Then you can use the `Options` struct to configure the cache and create an instance of `AsyncCache`.
+//!
+//! ```no_run
+//! use async_cache::{AsyncCache, Fetcher, Options};
+//! use faststr::FastStr;
+//! use std::time::Duration;
+//!
+//! #[derive(Clone, PartialEq)]
+//! struct MyValue(u32);
+//!
+//! struct MyFetcher;
+//!
+//! #[async_trait::async_trait]
+//! impl Fetcher<MyValue> for MyFetcher {
+//!     type Error = anyhow::Error;
+//!
+//!     //// The implementation of fetch function should return the value associated with a key, or an error if it fails.
+//!     async fn fetch(&self, key: FastStr) -> Result<MyValue, Self::Error> {
+//!         // Your implementation here
+//!         Ok(MyValue(100))
+//!     }
+//! }
+//!
+//! let mut cache =
+//!     Options::new(Duration::from_secs(10), MyFetcher).with_expire(Some(Duration::from_secs(10)))
+//!         .build();
+//!
+//! // Now you can use the cache to get and set values
+//! let key = FastStr::from("key");
+//! let val = cache.get_or_set(key.clone(), MyValue(50));
+//!
+//! assert_eq!(val, MyValue(50));
+//!
+//! let other_val = cache.get(key).await.unwrap();
+//!
+//! assert_eq!(other_val, MyValue(50));
+//!
+//! ```
+//!
+//! # Design
+//!
+//! AsyncCache uses async-singleflight to reduce redundant load on underlying fetcher, requests from different future tasks with the same key will only trigger a single fetcher call.
+//!
+//! It also provides a few channels to notify the client of the cache when the cache is updated or there was an error with a fetch.
+//!
+//! `AsyncCache` is thread-safe and can be cloned and shared across tasks.
+//!
+//! # Example
+//!
+//! ```ignore
+//! use async_cache::{AsyncCache, Options};
+//! use faststr::FastStr;
+//! use std::time::Duration;
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     let interval = Duration::from_millis(100);
+//!
+//!     let options = Options::new(interval, GitHubFetcher::new())
+//!         .with_expire(Some(Duration::from_secs(30)));
+//!
+//!     let cache = options.build();
+//!
+//!     let key = FastStr::from("your key");
+//!
+//!     match cache.get(key).await {
+//!         Some(v) => println!("value: {}", v),
+//!         None => println!("value not available"),
+//!     }
+//!
+//!     tokio::time::delay_for(Duration::from_secs(5)).await;
+//!
+//!     match cache.get(key).await {
+//!         Some(v) => println!("value: {}", v),
+//!         None => println!("value not available"),
+//!     }
+//! }
+//! ```
+
 use std::marker::PhantomData;
 use std::sync::atomic;
 use std::sync::Arc;
@@ -16,7 +99,7 @@ const DEFAULT_EXPIRE_DURATION: Duration = Duration::from_secs(180);
 #[async_trait::async_trait]
 pub trait Fetcher<T>
 where
-    T: Send + Sync + Clone + PartialEq + 'static,
+    T: Send + Sync + Clone + 'static,
 {
     type Error;
     async fn fetch(&self, key: FastStr) -> Result<T>;
@@ -24,7 +107,7 @@ where
 
 pub struct Options<T, F>
 where
-    T: Send + Sync + Clone + PartialEq + 'static,
+    T: Send + Sync + Clone + 'static,
     F: Fetcher<T> + Sync + Send + Clone + 'static,
 {
     refresh_interval: Duration,
@@ -42,7 +125,7 @@ where
 
 impl<T, F> Options<T, F>
 where
-    T: Send + Sync + Clone + PartialEq + 'static,
+    T: Send + Sync + Clone + 'static,
     F: Fetcher<T> + Sync + Send + Clone + 'static,
 {
     pub fn new(refresh_interval: Duration, fetcher: F) -> Self {
@@ -98,7 +181,7 @@ where
 #[derive(Clone)]
 pub struct AsyncCache<T, F>
 where
-    T: Send + Sync + Clone + PartialEq + 'static,
+    T: Send + Sync + Clone + 'static,
     F: Fetcher<T> + Sync + Send + Clone + 'static,
 {
     inner: Arc<AsyncCacheRef<T, F>>,
@@ -117,7 +200,7 @@ impl<T> Entry<T> {
 
 struct AsyncCacheRef<T, F>
 where
-    T: Send + Sync + Clone + PartialEq + 'static,
+    T: Send + Sync + Clone + 'static,
     F: Fetcher<T> + Sync + Send + Clone + 'static,
 {
     options: Options<T, F>,
@@ -127,7 +210,7 @@ where
 
 impl<T, F> AsyncCache<T, F>
 where
-    T: Send + Sync + Clone + PartialEq + 'static,
+    T: Send + Sync + Clone + 'static,
     F: Fetcher<T> + Sync + Send + Clone + 'static,
 {
     /// SetDefault sets the default value of given key if it is new to the cache.

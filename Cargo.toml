@@ -1,8 +1,8 @@
 [package]
 name = "async_cache"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Pure White <wudi@purewhite.io>"]
-edition = "2018"
+edition = "2021"
 description = "Async refresh cache."
 repository = "https://github.com/PureWhiteWu/async_cache"
 license = "MIT OR Apache-2.0"
@@ -18,8 +18,8 @@ faststr = "0.2"
 futures = "0.3"
 parking_lot = "0.12"
 hashbrown = "0.13"
-tokio = { version = "1", features = ["sync", "time"]}
+tokio = { version = "1", features = ["sync", "time"] }
 async_singleflight = "0.5"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["full"]}
+tokio = { version = "1", features = ["full"] }
