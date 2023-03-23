@@ -1,8 +1,9 @@
+---
 name: cargo test
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
 
 env:
@@ -10,7 +11,6 @@ env:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     steps:
