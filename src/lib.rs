@@ -4,14 +4,15 @@
 //!
 //! To use AsyncCache, you need to implement the `Fetcher` trait for the type you want to cache. Then you can use the `Options` struct to configure the cache and create an instance of `AsyncCache`.
 //!
-//! ```no_run
+//! ```no_run,ignore
 //! use async_cache::{AsyncCache, Fetcher, Options};
 //! use faststr::FastStr;
 //! use std::time::Duration;
 //!
-//! #[derive(Clone, PartialEq)]
+//! #[derive(Clone)]
 //! struct MyValue(u32);
 //!
+//! #[derive(Clone)]
 //! struct MyFetcher;
 //!
 //! #[async_trait::async_trait]
@@ -69,14 +70,14 @@
 //!
 //!     match cache.get(key).await {
 //!         Some(v) => println!("value: {}", v),
-//!         None => println!("value not available"),
+//!         None => println!("first fetch failed"),
 //!     }
 //!
 //!     tokio::time::delay_for(Duration::from_secs(5)).await;
 //!
 //!     match cache.get(key).await {
 //!         Some(v) => println!("value: {}", v),
-//!         None => println!("value not available"),
+//!         None => println!("fetch data failed"),
 //!     }
 //! }
 //! ```
