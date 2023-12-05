@@ -8,7 +8,6 @@
 //! use async_cache::{AsyncCache, Fetcher, Options};
 //! use faststr::FastStr;
 //! use std::time::Duration;
-//! use dashmap::DashMap;
 //!
 //! #[derive(Clone)]
 //! struct MyValue(u32);
@@ -88,7 +87,6 @@ use std::sync::atomic;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ahash;
 use anyhow::Result;
 use async_singleflight::Group;
 use dashmap::DashMap;
