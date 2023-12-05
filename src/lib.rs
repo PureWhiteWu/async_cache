@@ -97,7 +97,7 @@ use futures::{prelude::*, stream::FuturesOrdered};
 use tokio::sync::{broadcast, mpsc};
 
 const DEFAULT_EXPIRE_DURATION: Duration = Duration::from_secs(180);
-const DEFAULT_CACHE_CAPACITY: usize = 10;
+const DEFAULT_CACHE_CAPACITY: usize = 16;
 
 #[async_trait::async_trait]
 pub trait Fetcher<T>
@@ -115,6 +115,7 @@ where
 {
     refresh_interval: Duration,
     expire_interval: Option<Duration>,
+    capacity: usize,
 
     fetcher: F,
     phantom: PhantomData<T>,
@@ -135,6 +136,7 @@ where
         Self {
             refresh_interval,
             expire_interval: Some(DEFAULT_EXPIRE_DURATION),
+            capacity: DEFAULT_CACHE_CAPACITY,
             fetcher,
             phantom: PhantomData,
             error_tx: None,
@@ -160,6 +162,11 @@ where
 
     pub fn with_delete_tx(mut self, tx: broadcast::Sender<(FastStr, T)>) -> Self {
         self.delete_tx = Some(tx);
+        self
+    }
+
+    pub fn with_capacity(mut self, capacity: usize) -> Self {
+        self.capacity = capacity;
         self
     }
 
@@ -282,7 +289,7 @@ where
             .data
             .iter()
             .filter(|ref_mul| should_delete(ref_mul.key()))
-            .map(|k| k.key().clone())
+            .map(|kv_ref| kv_ref.key().clone())
             .collect::<Vec<_>>();
 
         for k in delete_keys {
@@ -370,10 +377,11 @@ where
     async fn expire_cron(&self) {
         let mut interval = tokio::time::interval(self.inner.options.expire_interval.unwrap());
 
+        let mut delete_keys = Vec::with_capacity(self.inner.data.len() / 2);
         loop {
             interval.tick().await;
 
-            let mut delete_keys = Vec::with_capacity(self.inner.data.len() / 2);
+            delete_keys.clear();
             for kv_ref in self.inner.data.iter() {
                 if kv_ref.value().expire.load(atomic::Ordering::Relaxed) {
                     delete_keys.push(kv_ref.key().clone());
@@ -384,9 +392,9 @@ where
             }
 
             // second round, delete expired data
-            for k in delete_keys {
-                if let Some((_, ety)) = self.inner.data.remove(&k) {
-                    self.send_delete(k, ety.val);
+            for k in delete_keys.iter() {
+                if let Some((_, ety)) = self.inner.data.remove(k) {
+                    self.send_delete(k.clone(), ety.val);
                 }
             }
         }
@@ -430,5 +438,13 @@ mod tests {
         let first_fetch = ac.get("123".into()).await;
         assert_eq!(first_fetch.unwrap(), 1);
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    }
+
+    #[tokio::test]
+    async fn capacity_works() {
+        let ac = Options::new(std::time::Duration::from_secs(5), TestFetcher)
+            .with_capacity(10)
+            .build();
+        assert_eq!(ac.inner.data.capacity(), 10);
     }
 }

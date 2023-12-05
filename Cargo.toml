@@ -1,7 +1,7 @@
 [package]
 name = "async_cache"
 version = "0.1.4"
-authors = ["Pure White <wudi@purewhite.io>"]
+authors = ["Pure White <wudi@purewhite.io>", "Giggle <wjdew@foxmail.com>"]
 edition = "2021"
 description = "Async refresh cache."
 repository = "https://github.com/PureWhiteWu/async_cache"
