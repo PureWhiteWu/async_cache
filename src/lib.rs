@@ -389,8 +389,9 @@ where
 
             // second round, delete expired data
             for k in delete_keys {
-                let ety = data.remove(&k).unwrap();
-                self.send_delete(k, ety.val);
+                if let Some(ety) = data.remove(&k) {
+                    self.send_delete(k, ety.val);
+                }
             }
             drop(data);
         }
