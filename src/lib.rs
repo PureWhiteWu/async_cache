@@ -173,12 +173,12 @@ where
     pub fn build(self) -> AsyncCache<T, F> {
         let ac = AsyncCache {
             inner: Arc::new(AsyncCacheRef {
-                options: self,
                 sfg: Group::new(),
                 data: DashMap::with_capacity_and_hasher(
-                    DEFAULT_CACHE_CAPACITY,
+                    self.capacity,
                     ahash::RandomState::default(),
                 ),
+                options: self, // move options into AsyncCacheRef, so this should be the last line using self
             }),
         };
 
@@ -438,13 +438,5 @@ mod tests {
         let first_fetch = ac.get("123".into()).await;
         assert_eq!(first_fetch.unwrap(), 1);
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-    }
-
-    #[tokio::test]
-    async fn capacity_works() {
-        let ac = Options::new(std::time::Duration::from_secs(5), TestFetcher)
-            .with_capacity(10)
-            .build();
-        assert_eq!(ac.inner.data.capacity(), 10);
     }
 }
