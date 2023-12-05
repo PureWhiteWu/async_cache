@@ -100,7 +100,7 @@ const DEFAULT_EXPIRE_DURATION: Duration = Duration::from_secs(180);
 #[async_trait::async_trait]
 pub trait Fetcher<T>
 where
-    T: Send + Sync + Clone + 'static,
+    T: Send + Sync + 'static,
 {
     type Error;
     async fn fetch(&self, key: FastStr) -> Result<T>;
@@ -169,12 +169,22 @@ where
                 data: RwLock::new(HashMap::new()),
             }),
         };
+
         tokio::spawn({
             let ac = ac.clone();
             async move {
                 ac.refresh().await;
             }
         });
+
+        if ac.is_expiration_enabled() {
+            tokio::spawn({
+                let ac = ac.clone();
+                async move {
+                    ac.expire_cron().await;
+                }
+            });
+        }
         ac
     }
 }
@@ -314,59 +324,75 @@ where
         loop {
             interval.tick().await;
 
+            // first, get all keys
             let keys: Vec<FastStr>;
             {
-                // first, delete expired data
+                {
+                    let data = self.inner.data.read();
+                    keys = data.keys().cloned().collect();
+                    drop(data);
+                }
+
+                // after that, fetch all data using the keys
+                let mut futures = FuturesOrdered::new();
+                for k in &keys {
+                    let fut = self.inner.options.fetcher.fetch(k.clone());
+                    futures.push_back(fut);
+                }
+
+                // and save them into a new vec
+                let mut new_data = Vec::with_capacity(futures.len());
+                assert!(futures.len() == keys.len());
+                let mut key_index = 0;
+                while let Some(res) = futures.next().await {
+                    let key = unsafe { keys.get_unchecked(key_index) }.clone();
+                    key_index += 1;
+                    match res {
+                        Ok(v) => new_data.push(Some(v)),
+                        Err(e) => {
+                            self.send_err(key, e).await;
+                            new_data.push(None);
+                        }
+                    }
+                }
+
+                // finally, replace the old data with the new one
                 let mut data = self.inner.data.write();
-                let mut delete_keys = Vec::with_capacity(data.keys().len() / 2);
-                for (k, v) in data.iter() {
-                    if v.expire.load(atomic::Ordering::Relaxed) {
-                        delete_keys.push(k.clone());
-                    } else {
-                        v.expire.store(true, atomic::Ordering::Relaxed);
-                    }
-                }
-
-                for k in delete_keys {
-                    let ety = data.remove(&k).unwrap();
-                    self.send_delete(k, ety.val);
-                }
-
-                // then, get all keys
-                keys = data.keys().cloned().collect();
-                drop(data);
-            }
-
-            // after that, fetch all data using the keys
-            let mut futures = FuturesOrdered::new();
-            for k in &keys {
-                let fut = self.inner.options.fetcher.fetch(k.clone());
-                futures.push_back(fut);
-            }
-
-            // and save them into a new vec
-            let mut new_data = Vec::with_capacity(futures.len());
-            assert!(futures.len() == keys.len());
-            let mut key_index = 0;
-            while let Some(res) = futures.next().await {
-                let key = unsafe { keys.get_unchecked(key_index) }.clone();
-                key_index += 1;
-                match res {
-                    Ok(v) => new_data.push(Some(v)),
-                    Err(e) => {
-                        self.send_err(key, e).await;
-                        new_data.push(None);
+                for (k, v) in keys.into_iter().zip(new_data.into_iter()) {
+                    if let Some(v) = v {
+                        data.get_mut(&k).unwrap().val = v;
                     }
                 }
             }
+        }
+    }
+    fn is_expiration_enabled(&self) -> bool {
+        self.inner.options.expire_interval.is_some()
+    }
 
-            // finally, replace the old data with the new one
+    async fn expire_cron(&self) {
+        let mut interval = tokio::time::interval(self.inner.options.expire_interval.unwrap());
+
+        loop {
+            interval.tick().await;
+
             let mut data = self.inner.data.write();
-            for (k, v) in keys.into_iter().zip(new_data.into_iter()) {
-                if let Some(v) = v {
-                    data.get_mut(&k).unwrap().val = v;
+            let mut delete_keys = Vec::with_capacity(data.keys().len() / 2);
+            for (k, v) in data.iter() {
+                if v.expire.load(atomic::Ordering::Relaxed) {
+                    delete_keys.push(k.clone());
+                } else {
+                    // first round, mark as expired
+                    v.expire.store(true, atomic::Ordering::Relaxed);
                 }
             }
+
+            // second round, delete expired data
+            for k in delete_keys {
+                let ety = data.remove(&k).unwrap();
+                self.send_delete(k, ety.val);
+            }
+            drop(data);
         }
     }
 }
@@ -385,6 +411,7 @@ mod tests {
     impl crate::Fetcher<usize> for TestFetcher {
         type Error = Infallible;
         async fn fetch(&self, _: FastStr) -> Result<usize> {
+            println!("fetching...");
             Ok(1)
         }
     }
@@ -394,5 +421,18 @@ mod tests {
         let ac = Options::new(std::time::Duration::from_secs(5), TestFetcher).build();
         let first_fetch = ac.get("123".into()).await;
         assert_eq!(first_fetch.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn expire_works() {
+        // async behaviors: first fetch(0s), refresh (2s), expire(3s), refresh(4s), delete(6s)
+        // so, `println!("fetching...");` is expected to be called three times.
+        let expire_interval = std::time::Duration::from_secs(3);
+        let ac = Options::new(std::time::Duration::from_secs(2), TestFetcher)
+            .with_expire(Some(expire_interval))
+            .build();
+        let first_fetch = ac.get("123".into()).await;
+        assert_eq!(first_fetch.unwrap(), 1);
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
     }
 }
