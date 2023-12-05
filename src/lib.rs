@@ -8,6 +8,7 @@
 //! use async_cache::{AsyncCache, Fetcher, Options};
 //! use faststr::FastStr;
 //! use std::time::Duration;
+//! use dashmap::DashMap;
 //!
 //! #[derive(Clone)]
 //! struct MyValue(u32);
@@ -87,15 +88,16 @@ use std::sync::atomic;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ahash;
 use anyhow::Result;
 use async_singleflight::Group;
+use dashmap::DashMap;
 use faststr::FastStr;
 use futures::{prelude::*, stream::FuturesOrdered};
-use hashbrown::HashMap;
-use parking_lot::RwLock;
 use tokio::sync::{broadcast, mpsc};
 
 const DEFAULT_EXPIRE_DURATION: Duration = Duration::from_secs(180);
+const DEFAULT_CACHE_CAPACITY: usize = 10;
 
 #[async_trait::async_trait]
 pub trait Fetcher<T>
@@ -166,7 +168,10 @@ where
             inner: Arc::new(AsyncCacheRef {
                 options: self,
                 sfg: Group::new(),
-                data: RwLock::new(HashMap::new()),
+                data: DashMap::with_capacity_and_hasher(
+                    DEFAULT_CACHE_CAPACITY,
+                    ahash::RandomState::default(),
+                ),
             }),
         };
 
@@ -216,7 +221,7 @@ where
 {
     options: Options<T, F>,
     sfg: Group<T, anyhow::Error>,
-    data: RwLock<HashMap<FastStr, Entry<T>>>,
+    data: DashMap<FastStr, Entry<T>, ahash::RandomState>,
 }
 
 impl<T, F> AsyncCache<T, F>
@@ -227,25 +232,22 @@ where
     /// SetDefault sets the default value of given key if it is new to the cache.
     /// It is useful for cache warming up.
     pub fn set_default(&self, key: FastStr, value: T) {
-        let mut data = self.inner.data.write();
         let ety = Entry {
             val: value,
             expire: atomic::AtomicBool::new(false),
         };
-        data.entry(key).or_insert(ety);
+        self.inner.data.entry(key).or_insert(ety);
     }
 
     /// Returns None if first fetch result is err
     pub async fn get(&self, key: FastStr) -> Option<T> {
         // get value direct from data if exists
         {
-            let data = self.inner.data.read();
-            let value = data.get(&key);
+            let value = self.inner.data.get(&key);
             if let Some(entry) = value {
                 entry.touch();
                 return Some(entry.val.clone());
             }
-            drop(data);
         }
 
         // get data
@@ -264,31 +266,29 @@ where
 
     pub fn get_or_set(&self, key: FastStr, value: T) -> T {
         // get value directly from data if exists
-        let data = self.inner.data.read();
-        let ety = data.get(&key);
+        let ety = self.inner.data.get(&key);
         if let Some(ety) = ety {
             ety.touch();
             return ety.val.clone();
         }
-        drop(data);
 
         self.insert_value(key, value.clone());
         value
     }
 
     pub async fn delete(&self, should_delete: impl Fn(&str) -> bool) {
-        let mut data = self.inner.data.write();
-        let mut delete_keys = Vec::with_capacity(data.keys().len() / 2);
-
-        for k in data.keys() {
-            if should_delete(k) {
-                delete_keys.push(k.clone());
-            }
-        }
+        let delete_keys = self
+            .inner
+            .data
+            .iter()
+            .filter(|ref_mul| should_delete(ref_mul.key()))
+            .map(|k| k.key().clone())
+            .collect::<Vec<_>>();
 
         for k in delete_keys {
-            let ety = data.remove(&k).unwrap();
-            self.send_delete(k, ety.val);
+            if let Some((_, ety)) = self.inner.data.remove(&k) {
+                self.send_delete(k, ety.val);
+            }
         }
     }
 
@@ -298,9 +298,7 @@ where
             val: value,
             expire: atomic::AtomicBool::new(false),
         };
-        let mut data = self.inner.data.write();
-        data.insert(key, ety);
-        drop(data);
+        self.inner.data.insert(key, ety);
     }
 
     fn send_delete(&self, key: FastStr, value: T) {
@@ -325,42 +323,41 @@ where
             interval.tick().await;
 
             // first, get all keys
-            let keys: Vec<FastStr>;
-            {
-                {
-                    let data = self.inner.data.read();
-                    keys = data.keys().cloned().collect();
-                    drop(data);
-                }
+            let keys: Vec<FastStr> = self
+                .inner
+                .data
+                .iter()
+                .map(|kv_ref| kv_ref.key().clone())
+                .collect();
 
-                // after that, fetch all data using the keys
-                let mut futures = FuturesOrdered::new();
-                for k in &keys {
-                    let fut = self.inner.options.fetcher.fetch(k.clone());
-                    futures.push_back(fut);
-                }
+            // after that, fetch all data using the keys
+            let mut futures = FuturesOrdered::new();
+            for k in &keys {
+                let fut = self.inner.options.fetcher.fetch(k.clone());
+                futures.push_back(fut);
+            }
 
-                // and save them into a new vec
-                let mut new_data = Vec::with_capacity(futures.len());
-                assert!(futures.len() == keys.len());
-                let mut key_index = 0;
-                while let Some(res) = futures.next().await {
-                    let key = unsafe { keys.get_unchecked(key_index) }.clone();
-                    key_index += 1;
-                    match res {
-                        Ok(v) => new_data.push(Some(v)),
-                        Err(e) => {
-                            self.send_err(key, e).await;
-                            new_data.push(None);
-                        }
+            // and save them into a new vec
+            let mut new_data = Vec::with_capacity(futures.len());
+            assert!(futures.len() == keys.len());
+            let mut key_index = 0;
+            while let Some(res) = futures.next().await {
+                let key = unsafe { keys.get_unchecked(key_index) }.clone();
+                key_index += 1;
+                match res {
+                    Ok(v) => new_data.push(Some(v)),
+                    Err(e) => {
+                        self.send_err(key, e).await;
+                        new_data.push(None);
                     }
                 }
+            }
 
-                // finally, replace the old data with the new one
-                let mut data = self.inner.data.write();
-                for (k, v) in keys.into_iter().zip(new_data.into_iter()) {
-                    if let Some(v) = v {
-                        data.get_mut(&k).unwrap().val = v;
+            // finally, replace the old data with the new one
+            for (k, v) in keys.into_iter().zip(new_data.into_iter()) {
+                if let Some(v) = v {
+                    if let Some(mut old) = self.inner.data.get_mut(&k) {
+                        old.val = v;
                     }
                 }
             }
@@ -376,24 +373,22 @@ where
         loop {
             interval.tick().await;
 
-            let mut data = self.inner.data.write();
-            let mut delete_keys = Vec::with_capacity(data.keys().len() / 2);
-            for (k, v) in data.iter() {
-                if v.expire.load(atomic::Ordering::Relaxed) {
-                    delete_keys.push(k.clone());
+            let mut delete_keys = Vec::with_capacity(self.inner.data.len() / 2);
+            for kv_ref in self.inner.data.iter() {
+                if kv_ref.value().expire.load(atomic::Ordering::Relaxed) {
+                    delete_keys.push(kv_ref.key().clone());
                 } else {
                     // first round, mark as expired
-                    v.expire.store(true, atomic::Ordering::Relaxed);
+                    kv_ref.value().expire.store(true, atomic::Ordering::Relaxed);
                 }
             }
 
             // second round, delete expired data
             for k in delete_keys {
-                if let Some(ety) = data.remove(&k) {
+                if let Some((_, ety)) = self.inner.data.remove(&k) {
                     self.send_delete(k, ety.val);
                 }
             }
-            drop(data);
         }
     }
 }
