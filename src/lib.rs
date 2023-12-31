@@ -87,7 +87,6 @@ use std::sync::atomic;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
 use async_singleflight::Group;
 use dashmap::DashMap;
 use faststr::FastStr;
@@ -102,8 +101,8 @@ pub trait Fetcher<T>
 where
     T: Send + Sync + 'static,
 {
-    type Error;
-    async fn fetch(&self, key: FastStr) -> Result<T>;
+    type Error: Send;
+    async fn fetch(&self, key: FastStr) -> core::result::Result<T, Self::Error>;
 }
 
 pub struct Options<T, F>
@@ -118,7 +117,7 @@ where
     fetcher: F,
     phantom: PhantomData<T>,
 
-    error_tx: Option<mpsc::Sender<(FastStr, anyhow::Error)>>, // key, error
+    error_tx: Option<mpsc::Sender<(FastStr, F::Error)>>, // key, error
 
     change_tx: Option<broadcast::Sender<(FastStr, T, T)>>, // key, old, new
 
@@ -148,7 +147,7 @@ where
         self
     }
 
-    pub fn with_error_tx(mut self, tx: mpsc::Sender<(FastStr, anyhow::Error)>) -> Self {
+    pub fn with_error_tx(mut self, tx: mpsc::Sender<(FastStr, F::Error)>) -> Self {
         self.error_tx = Some(tx);
         self
     }
@@ -225,7 +224,7 @@ where
     F: Fetcher<T> + Sync + Send + Clone + 'static,
 {
     options: Options<T, F>,
-    sfg: Group<T, anyhow::Error>,
+    sfg: Group<T, F::Error>,
     data: DashMap<FastStr, Entry<T>, ahash::RandomState>,
 }
 
@@ -314,7 +313,7 @@ where
         }
     }
 
-    async fn send_err(&self, key: FastStr, err: anyhow::Error) {
+    async fn send_err(&self, key: FastStr, err: F::Error) {
         let tx = self.inner.options.error_tx.clone();
         if let Some(tx) = tx {
             let _ = tx.send((key, err)).await;
@@ -402,7 +401,6 @@ where
 #[cfg(test)]
 mod tests {
     use crate::Options;
-    use anyhow::Result;
     use faststr::FastStr;
     use std::convert::Infallible;
 
@@ -412,7 +410,7 @@ mod tests {
     #[async_trait::async_trait]
     impl crate::Fetcher<usize> for TestFetcher {
         type Error = Infallible;
-        async fn fetch(&self, _: FastStr) -> Result<usize> {
+        async fn fetch(&self, _: FastStr) -> Result<usize, Self::Error> {
             println!("fetching...");
             Ok(1)
         }
