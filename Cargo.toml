@@ -1,6 +1,6 @@
 [package]
 name = "async_cache"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Pure White <wudi@purewhite.io>", "Giggle <wjdew@foxmail.com>"]
 edition = "2021"
 description = "Async refresh cache."
@@ -14,7 +14,6 @@ readme = "README.md"
 
 [dependencies]
 anyhow = "1"
-async-trait = "0.1"
 faststr = "0.2"
 futures = "0.3"
 parking_lot = "0.12"
