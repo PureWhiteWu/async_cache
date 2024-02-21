@@ -15,7 +15,6 @@
 //! #[derive(Clone)]
 //! struct MyFetcher;
 //!
-//! #[async_trait::async_trait]
 //! impl Fetcher<MyValue> for MyFetcher {
 //!     type Error = anyhow::Error;
 //!
@@ -96,13 +95,16 @@ use tokio::sync::{broadcast, mpsc};
 const DEFAULT_EXPIRE_DURATION: Duration = Duration::from_secs(180);
 const DEFAULT_CACHE_CAPACITY: usize = 16;
 
-#[async_trait::async_trait]
 pub trait Fetcher<T>
 where
     T: Send + Sync + 'static,
 {
     type Error: Send;
-    async fn fetch(&self, key: FastStr) -> core::result::Result<T, Self::Error>;
+
+    fn fetch(
+        &self,
+        key: FastStr,
+    ) -> impl std::future::Future<Output = core::result::Result<T, Self::Error>> + std::marker::Send;
 }
 
 pub struct Options<T, F>
@@ -407,7 +409,6 @@ mod tests {
     #[derive(Clone)]
     struct TestFetcher;
 
-    #[async_trait::async_trait]
     impl crate::Fetcher<usize> for TestFetcher {
         type Error = Infallible;
         async fn fetch(&self, _: FastStr) -> Result<usize, Self::Error> {
