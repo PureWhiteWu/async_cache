@@ -110,7 +110,7 @@ where
 pub struct Options<T, F>
 where
     T: Send + Sync + Clone + 'static,
-    F: Fetcher<T> + Sync + Send + Clone + 'static,
+    F: Fetcher<T> + Sync + Send + 'static,
 {
     refresh_interval: Duration,
     expire_interval: Option<Duration>,
@@ -129,7 +129,7 @@ where
 impl<T, F> Options<T, F>
 where
     T: Send + Sync + Clone + 'static,
-    F: Fetcher<T> + Sync + Send + Clone + 'static,
+    F: Fetcher<T> + Sync + Send + 'static,
 {
     pub fn new(refresh_interval: Duration, fetcher: F) -> Self {
         Self {
@@ -200,13 +200,24 @@ where
     }
 }
 
-#[derive(Clone)]
 pub struct AsyncCache<T, F>
 where
     T: Send + Sync + Clone + 'static,
-    F: Fetcher<T> + Sync + Send + Clone + 'static,
+    F: Fetcher<T> + Sync + Send + 'static,
 {
     inner: Arc<AsyncCacheRef<T, F>>,
+}
+
+impl<T, F> Clone for AsyncCache<T, F>
+where
+    T: Send + Sync + Clone + 'static,
+    F: Fetcher<T> + Sync + Send + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 struct Entry<T> {
@@ -223,7 +234,7 @@ impl<T> Entry<T> {
 struct AsyncCacheRef<T, F>
 where
     T: Send + Sync + Clone + 'static,
-    F: Fetcher<T> + Sync + Send + Clone + 'static,
+    F: Fetcher<T> + Sync + Send + 'static,
 {
     options: Options<T, F>,
     sfg: Group<T, F::Error>,
@@ -233,7 +244,7 @@ where
 impl<T, F> AsyncCache<T, F>
 where
     T: Send + Sync + Clone + 'static,
-    F: Fetcher<T> + Sync + Send + Clone + 'static,
+    F: Fetcher<T> + Sync + Send + 'static,
 {
     /// SetDefault sets the default value of given key if it is new to the cache.
     /// It is useful for cache warming up.
