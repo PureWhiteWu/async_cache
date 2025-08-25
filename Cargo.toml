@@ -1,6 +1,6 @@
 [package]
 name = "async_cache"
-version = "0.3.1"
+version = "0.3.2"
 authors = ["Pure White <wudi@purewhite.io>", "Giggle <wjdew@foxmail.com>"]
 edition = "2021"
 description = "Async refresh cache."
@@ -17,10 +17,10 @@ anyhow = "1"
 faststr = "0.2"
 futures = "0.3"
 parking_lot = "0.12"
-hashbrown = "0.14"
+hashbrown = "0.15"
 tokio = { version = "1", features = ["sync", "time", "rt"] }
 async_singleflight = "0.5"
-dashmap = "5"
+dashmap = "6"
 ahash = "0.8"
 
 [dev-dependencies]
