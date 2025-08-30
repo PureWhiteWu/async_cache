@@ -5,68 +5,67 @@ This library provides an async cache implementation that can be used to store an
 # API Overview
 
 ```rust
-pub trait Fetcher<T>
+pub trait Fetcher<K, T>
 where
     T: Send + Sync + Clone + 'static,
 {
-    type Error;
-    async fn fetch(&self, key: FastStr) -> Result<T>;
+    type Error: Send;
+
+    async fn fetch(&self, key: K) -> Result<T, Self::Error>;
 }
 ```
 
 ```rust
-pub struct Options<T, F> {
-    ...
-}
+pub struct AsyncCacheBuilder<K, T, F, S = DefaultRandomState>;
 
-impl<T, F> Options<T, F>
+impl<K, T, F, S> AsyncCacheBuilder<K, T, F, S>
 where
     T: Send + Sync + Clone + 'static,
-    F: Fetcher<T> + Sync + Send + Clone + 'static,
+    F: Fetcher<K, T> + Sync + Send + 'static,
 {
     pub fn new(refresh_interval: Duration, fetcher: F) -> Self;
 
     pub fn with_expire(mut self, expire_interval: Option<Duration>) -> Self;
 
-    pub fn with_error_tx(mut self, tx: mpsc::Sender<(FastStr, anyhow::Error)>) -> Self;
+    pub fn with_error_tx(mut self, tx: mpsc::Sender<(K, F::Error)>) -> Self;
 
-    pub fn with_change_tx(mut self, tx: broadcast::Sender<(FastStr, T, T)>) -> Self;
+    pub fn with_delete_tx(mut self, tx: broadcast::Sender<(K, T)>) -> Self;
 
-    pub fn with_delete_tx(mut self, tx: broadcast::Sender<(FastStr, T)>) -> Self;
-
-    pub fn build(self) -> AsyncCache<T, F>;
+    pub fn build(self) -> AsyncCache<K, T, F, S>
 }
 ```
 
 ```rust
-pub struct AsyncCache<T, F> {
-    ...
-}
+pub struct AsyncCache<K, T, F, S = DefaultRandomState>;
 
-impl<T, F> AsyncCache<T, F>
+impl<K, T, F, S> AsyncCache<K, T, F, S>
 where
+    K: Eq + Hash + Sync + Send + Clone,
+    F: Fetcher<K, T> + Sync + Send,
     T: Send + Sync + Clone + 'static,
-    F: Fetcher<T> + Sync + Send + Clone + 'static,
+    S: BuildHasher + Clone + 'static,
 {
-    pub fn set_default(&self, key: FastStr, value: T);
+    pub fn builder(refresh_interval: Duration, fetcher: F) -> AsyncCacheBuilder<K, T, F, S>;
 
-    pub async fn get(&self, key: FastStr) -> Option<T>;
+    pub fn set_default(&self, key: K, value: T);
 
-    pub fn get_or_set(&self, key: FastStr, value: T) -> T;
+    pub async fn get(&self, key: K) -> Option<T>;
+    pub fn get_or_set(&self, key: &K, value: T) -> T;
 
-    pub async fn delete(&self, should_delete: impl Fn(&str) -> bool);
+    pub fn delete(&self, prediction: impl Fn(&K) -> bool);
+    pub fn retain(&self, prediction: impl Fn(&K, &mut T) -> bool);
 }
 ```
 
 # Guide
 
-To use AsyncCache, you need to implement the `Fetcher` trait for the type you want to cache. Then you can use the `Options` struct to configure the cache and create an instance of `AsyncCache`.
+To use AsyncCache, you need to implement the `Fetcher` trait for the type you want to cache. Then you can use the `AsyncCacheBuilder` struct to configure the cache and create an instance of `AsyncCache`.
 
-Create an instance of `AsyncCache` using the `Options` struct.
+Create an instance of `AsyncCache` using the `AsyncCacheBuilder` struct.
 
 ```rust
-let options = Options::new(Duration::from_secs(60), YourFetcher);
-let cache = options.build();
+let builder = AsyncCache::builder(Duration::from_secs(60), YourFetcher);
+let cache = builder.build();
 ```
 
 Then, you can interact with the cache by using its methods: `set_default`, `get`, `get_or_set`, and `delete`.
@@ -111,23 +110,20 @@ cache.delete(|key| key.starts_with("prefix_")).await;
 
 This deletes all keys that start with the prefix "prefix\_" from the cache.
 
-## Options
+## Builder
 
-The `Options` struct is used to configure the `AsyncCache`. It takes in the `Fetcher` trait, the refresh interval, and an optional expire interval. You can also pass in mpsc channels to receive errors, changes to values, or deletions.
+The `AsyncCacheBuilder` struct is used to configure the `AsyncCache`. It takes in the `Fetcher` trait, the refresh interval, and an optional expire interval. You can also pass in mpsc channels to receive errors, changes to values, or deletions.
 
 ```rust
-let options = Options::new(Duration::from_secs(60), YourFetcher)
+let builder = AsyncCache::builder(Duration::from_secs(60), YourFetcher)
     .with_expire(Some(Duration::from_secs(60)))
     .with_error_tx(tx)
-    .with_change_tx(tx)
     .with_delete_tx(tx);
 ```
 
 `with_expire` sets the expire interval for the cache. If this is not set, the default expire interval is 180 seconds.
 
 `with_error_tx` sets the mpsc channel for receiving errors.
-
-`with_change_tx` sets the broadcast channel for receiving changes to values.
 
 `with_delete_tx` sets the broadcast channel for receiving deletions.
 
