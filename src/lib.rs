@@ -5,40 +5,37 @@
 //! To use AsyncCache, you need to implement the `Fetcher` trait for the type you want to cache. Then you can use the `Options` struct to configure the cache and create an instance of `AsyncCache`.
 //!
 //! ```no_run,ignore
-//! use async_cache::{AsyncCache, Fetcher, Options};
-//! use faststr::FastStr;
+//! use async_cache::{DefaultAsyncCache, Fetcher};
 //! use std::time::Duration;
 //!
-//! #[derive(Clone)]
+//! #[derive(Debug, Clone, PartialEq)]
 //! struct MyValue(u32);
 //!
 //! #[derive(Clone)]
 //! struct MyFetcher;
 //!
-//! impl Fetcher<MyValue> for MyFetcher {
-//!     type Error = anyhow::Error;
+//! impl Fetcher<u64, MyValue> for MyFetcher {
+//!     type Error = ();
 //!
 //!     //// The implementation of fetch function should return the value associated with a key, or an error if it fails.
-//!     async fn fetch(&self, key: FastStr) -> Result<MyValue, Self::Error> {
+//!     async fn fetch(&self, key: u64) -> Result<MyValue, Self::Error> {
 //!         // Your implementation here
 //!         Ok(MyValue(100))
 //!     }
 //! }
 //!
-//! let mut cache =
-//!     Options::new(Duration::from_secs(10), MyFetcher).with_expire(Some(Duration::from_secs(10)))
+//! let mut cache = DefaultAsyncCache::builder(Duration::from_secs(10), MyFetcher)
+//!         .with_expire(Some(Duration::from_secs(10)))
 //!         .build();
 //!
 //! // Now you can use the cache to get and set values
-//! let key = FastStr::from("key");
-//! let val = cache.get_or_set(key.clone(), MyValue(50));
+//! let val = cache.get_or_set(42, MyValue(50));
 //!
 //! assert_eq!(val, MyValue(50));
 //!
-//! let other_val = cache.get(key).await.unwrap();
+//! let other_val = cache.get(&42).await.unwrap();
 //!
 //! assert_eq!(other_val, MyValue(50));
-//!
 //! ```
 //!
 //! # Design
@@ -51,85 +48,79 @@
 //!
 //! # Example
 //!
-//! ```ignore
-//! use async_cache::{AsyncCache, Options};
-//! use faststr::FastStr;
+//! ```no_run,ignore
+//! use async_cache::DefaultAsyncCache;
 //! use std::time::Duration;
 //!
 //! #[tokio::main]
 //! async fn main() {
 //!     let interval = Duration::from_millis(100);
 //!
-//!     let options = Options::new(interval, GitHubFetcher::new())
-//!         .with_expire(Some(Duration::from_secs(30)));
+//!     let cache = DefaultAsyncCache::builder(interval, GitHubFetcher::new())
+//!         .with_expire(Some(Duration::from_secs(30)))
+//!         .build();
 //!
-//!     let cache = options.build();
-//!
-//!     let key = FastStr::from("your key");
-//!
-//!     match cache.get(key).await {
+//!     match cache.get(&42).await {
 //!         Some(v) => println!("value: {}", v),
 //!         None => println!("first fetch failed"),
 //!     }
 //!
-//!     tokio::time::delay_for(Duration::from_secs(5)).await;
+//!     tokio::time::sleep(Duration::from_secs(5)).await;
 //!
-//!     match cache.get(key).await {
+//!     match cache.get(&42).await {
 //!         Some(v) => println!("value: {}", v),
 //!         None => println!("fetch data failed"),
 //!     }
 //! }
 //! ```
-
+use std::future::Future;
+use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
-use std::sync::atomic;
-use std::sync::Arc;
+use std::sync::{atomic, Arc};
 use std::time::Duration;
 
 use async_singleflight::Group;
 use dashmap::DashMap;
-use faststr::FastStr;
 use futures::{prelude::*, stream::FuturesOrdered};
 use tokio::sync::{broadcast, mpsc};
 
 const DEFAULT_EXPIRE_DURATION: Duration = Duration::from_secs(180);
 const DEFAULT_CACHE_CAPACITY: usize = 16;
 
-pub trait Fetcher<T>
+pub trait Fetcher<K, T>
 where
     T: Send + Sync + 'static,
 {
     type Error: Send;
 
-    fn fetch(
-        &self,
-        key: FastStr,
-    ) -> impl std::future::Future<Output = core::result::Result<T, Self::Error>> + std::marker::Send;
+    fn fetch(&self, key: K) -> impl Future<Output = Result<T, Self::Error>> + Send;
 }
 
-pub struct Options<T, F>
+#[cfg(feature = "ahash")]
+type DefaultRandomState = ahash::RandomState;
+#[cfg(not(feature = "ahash"))]
+type DefaultRandomState = std::hash::RandomState;
+
+pub struct AsyncCacheBuilder<K, T, F, S = DefaultRandomState>
 where
-    T: Send + Sync + Clone + 'static,
-    F: Fetcher<T> + Sync + Send + 'static,
+    T: Send + Sync + 'static,
+    F: Fetcher<K, T>,
 {
     refresh_interval: Duration,
     expire_interval: Option<Duration>,
     capacity: usize,
-
     fetcher: F,
-    phantom: PhantomData<T>,
 
-    error_tx: Option<mpsc::Sender<(FastStr, F::Error)>>, // key, error
+    error_tx: Option<mpsc::Sender<(K, F::Error)>>, // key, error
+    delete_tx: Option<broadcast::Sender<(K, T)>>,  // key, value
 
-    change_tx: Option<broadcast::Sender<(FastStr, T, T)>>, // key, old, new
-
-    delete_tx: Option<broadcast::Sender<(FastStr, T)>>, // key, value
+    _marker: std::marker::PhantomData<S>,
 }
 
-impl<T, F> Options<T, F>
+impl<K, T, F, S> AsyncCacheBuilder<K, T, F, S>
 where
     T: Send + Sync + Clone + 'static,
-    F: Fetcher<T> + Sync + Send + 'static,
+    F: Fetcher<K, T> + Sync + Send + 'static,
 {
     pub fn new(refresh_interval: Duration, fetcher: F) -> Self {
         Self {
@@ -137,10 +128,9 @@ where
             expire_interval: Some(DEFAULT_EXPIRE_DURATION),
             capacity: DEFAULT_CACHE_CAPACITY,
             fetcher,
-            phantom: PhantomData,
             error_tx: None,
-            change_tx: None,
             delete_tx: None,
+            _marker: PhantomData,
         }
     }
 
@@ -149,17 +139,12 @@ where
         self
     }
 
-    pub fn with_error_tx(mut self, tx: mpsc::Sender<(FastStr, F::Error)>) -> Self {
+    pub fn with_error_tx(mut self, tx: mpsc::Sender<(K, F::Error)>) -> Self {
         self.error_tx = Some(tx);
         self
     }
 
-    pub fn with_change_tx(mut self, tx: broadcast::Sender<(FastStr, T, T)>) -> Self {
-        self.change_tx = Some(tx);
-        self
-    }
-
-    pub fn with_delete_tx(mut self, tx: broadcast::Sender<(FastStr, T)>) -> Self {
+    pub fn with_delete_tx(mut self, tx: broadcast::Sender<(K, T)>) -> Self {
         self.delete_tx = Some(tx);
         self
     }
@@ -169,49 +154,68 @@ where
         self
     }
 
-    pub fn build(self) -> AsyncCache<T, F> {
-        let ac = AsyncCache {
-            inner: Arc::new(AsyncCacheRef {
-                sfg: Group::new(),
-                data: DashMap::with_capacity_and_hasher(
-                    self.capacity,
-                    ahash::RandomState::default(),
-                ),
-                options: self, // move options into AsyncCacheRef, so this should be the last line using self
+    pub fn build(self) -> AsyncCache<K, T, F, S>
+    where
+        K: Eq + Hash + Sync + Send + Clone + 'static,
+        S: BuildHasher + Default + Clone + Sync + Send + 'static,
+    {
+        let expire_interval = self.expire_interval;
+        let refresh_interval = self.refresh_interval;
+
+        let cache = AsyncCache {
+            inner: Arc::new(AsyncCacheInner {
+                sfg: Group::<K, T, F::Error, S>::new(),
+                data: DashMap::with_capacity_and_hasher(self.capacity, S::default()),
+                options: AsyncCacheOptions {
+                    fetcher: self.fetcher,
+                    error_tx: self.error_tx,
+                    delete_tx: self.delete_tx,
+                },
             }),
         };
 
-        tokio::spawn({
-            let ac = ac.clone();
-            async move {
-                ac.refresh().await;
-            }
-        });
-
-        if ac.is_expiration_enabled() {
-            tokio::spawn({
-                let ac = ac.clone();
-                async move {
-                    ac.expire_cron().await;
-                }
+        {
+            let cache = cache.clone();
+            tokio::spawn(async move {
+                cache.refresh(refresh_interval).await;
             });
         }
-        ac
+
+        if let Some(expire_interval) = expire_interval {
+            let cache = cache.clone();
+            tokio::spawn(async move {
+                cache.expire_cron(expire_interval).await;
+            });
+        }
+
+        cache
     }
 }
 
-pub struct AsyncCache<T, F>
+struct AsyncCacheOptions<K, T, F>
 where
-    T: Send + Sync + Clone + 'static,
-    F: Fetcher<T> + Sync + Send + 'static,
+    T: Send + Sync + 'static,
+    F: Fetcher<K, T>,
 {
-    inner: Arc<AsyncCacheRef<T, F>>,
+    fetcher: F,
+    error_tx: Option<mpsc::Sender<(K, F::Error)>>, // key, error
+    delete_tx: Option<broadcast::Sender<(K, T)>>,  // key, value
 }
 
-impl<T, F> Clone for AsyncCache<T, F>
+pub type DefaultAsyncCache<K, T, F> = AsyncCache<K, T, F, DefaultRandomState>;
+
+pub struct AsyncCache<K, T, F, S = DefaultRandomState>
 where
-    T: Send + Sync + Clone + 'static,
-    F: Fetcher<T> + Sync + Send + 'static,
+    T: Send + Sync + 'static,
+    F: Fetcher<K, T> + Sync + Send + 'static,
+{
+    inner: Arc<AsyncCacheInner<K, T, F, S>>,
+}
+
+impl<K, T, F, S> Clone for AsyncCache<K, T, F, S>
+where
+    T: Send + Sync + 'static,
+    F: Fetcher<K, T> + Sync + Send + 'static,
 {
     fn clone(&self) -> Self {
         Self {
@@ -221,230 +225,248 @@ where
 }
 
 struct Entry<T> {
-    val: T,
+    // should always be Some until deleted
+    val: Option<T>,
     expire: atomic::AtomicBool,
 }
 
 impl<T> Entry<T> {
+    #[inline(always)]
+    fn new(val: T) -> Self {
+        Self {
+            val: Some(val),
+            expire: atomic::AtomicBool::new(false),
+        }
+    }
+
+    #[inline(always)]
     fn touch(&self) {
         self.expire.store(false, atomic::Ordering::Relaxed);
     }
 }
 
-struct AsyncCacheRef<T, F>
+struct AsyncCacheInner<K, T, F, S = DefaultRandomState>
 where
-    T: Send + Sync + Clone + 'static,
-    F: Fetcher<T> + Sync + Send + 'static,
+    T: Send + Sync + 'static,
+    F: Fetcher<K, T> + Sync + Send,
 {
-    options: Options<T, F>,
-    sfg: Group<T, F::Error>,
-    data: DashMap<FastStr, Entry<T>, ahash::RandomState>,
+    options: AsyncCacheOptions<K, T, F>,
+    sfg: Group<K, T, F::Error, S>,
+    data: DashMap<K, Entry<T>, S>,
 }
 
-impl<T, F> AsyncCache<T, F>
+impl<K, T, F, S> AsyncCache<K, T, F, S>
 where
+    K: Eq + Hash + Sync + Send + Clone,
+    F: Fetcher<K, T> + Sync + Send,
     T: Send + Sync + Clone + 'static,
-    F: Fetcher<T> + Sync + Send + 'static,
+    S: BuildHasher + Clone + 'static,
 {
+    /// get a builder to customize the cache
+    pub fn builder(refresh_interval: Duration, fetcher: F) -> AsyncCacheBuilder<K, T, F, S> {
+        AsyncCacheBuilder::new(refresh_interval, fetcher)
+    }
+
     /// SetDefault sets the default value of given key if it is new to the cache.
     /// It is useful for cache warming up.
-    pub fn set_default(&self, key: FastStr, value: T) {
-        let ety = Entry {
-            val: value,
-            expire: atomic::AtomicBool::new(false),
-        };
-        self.inner.data.entry(key).or_insert(ety);
+    pub fn set_default(&self, key: K, value: T) {
+        self.inner
+            .data
+            .entry(key)
+            .or_insert_with(|| Entry::new(value));
     }
 
     /// Returns None if first fetch result is err
-    pub async fn get(&self, key: FastStr) -> Option<T> {
+    pub async fn get(&self, key: &K) -> Option<T> {
         // get value direct from data if exists
+        if let Some(entry) = self.inner.data.get(key) {
+            entry.touch();
+            debug_assert!(entry.val.is_some());
+            return entry.val.clone();
+        }
+
+        match self
+            .inner
+            .sfg
+            .work(key, self.inner.options.fetcher.fetch(key.clone()))
+            .await
         {
-            let value = self.inner.data.get(&key);
-            if let Some(entry) = value {
-                entry.touch();
-                return Some(entry.val.clone());
+            Ok(value) => {
+                self.inner
+                    .data
+                    .insert(key.clone(), Entry::new(value.clone()));
+                Some(value)
             }
-        }
-
-        // get data
-        let fut = self.inner.options.fetcher.fetch(key.clone());
-        let (res, e, is_owner) = self.inner.sfg.work(&key, fut).await;
-        if is_owner {
-            if let Some(e) = e {
-                self.send_err(key, e).await;
-                return None;
+            Err(Some(err)) => {
+                self.send_error(key.clone(), err).await;
+                None
             }
-            let value = res.clone().unwrap();
-            self.insert_value(key, value);
+            Err(None) => None,
         }
-        res
     }
 
-    pub fn get_or_set(&self, key: FastStr, value: T) -> T {
-        // get value directly from data if exists
-        let ety = self.inner.data.get(&key);
-        if let Some(ety) = ety {
-            ety.touch();
-            return ety.val.clone();
-        }
-
-        self.insert_value(key, value.clone());
-        value
-    }
-
-    pub async fn delete(&self, should_delete: impl Fn(&str) -> bool) {
-        let delete_keys = self
+    pub fn get_or_set(&self, key: K, value: T) -> T {
+        let entry = self
             .inner
             .data
-            .iter()
-            .filter(|ref_mul| should_delete(ref_mul.key()))
-            .map(|kv_ref| kv_ref.key().clone())
-            .collect::<Vec<_>>();
+            .entry(key)
+            .or_insert_with(|| Entry::new(value));
 
-        for k in delete_keys {
-            if let Some((_, ety)) = self.inner.data.remove(&k) {
-                self.send_delete(k, ety.val);
+        entry.touch();
+        debug_assert!(entry.val.is_some());
+        entry.val.clone().unwrap()
+    }
+
+    pub fn delete(&self, prediction: impl Fn(&K) -> bool) {
+        self.retain(|key, _| !prediction(key));
+    }
+
+    pub fn retain(&self, mut prediction: impl FnMut(&K, &mut T) -> bool) {
+        self.inner.data.retain(|key, entry| {
+            debug_assert!(entry.val.is_some());
+            if prediction(key, entry.val.as_mut().unwrap()) {
+                true
+            } else {
+                self.send_delete(key.clone(), entry.val.take());
+                false
             }
-        }
+        });
     }
 
-    fn insert_value(&self, key: FastStr, value: T) {
-        // set data
-        let ety = Entry {
-            val: value,
-            expire: atomic::AtomicBool::new(false),
-        };
-        self.inner.data.insert(key, ety);
-    }
-
-    fn send_delete(&self, key: FastStr, value: T) {
-        let tx = &self.inner.options.delete_tx;
-        if tx.is_some() {
-            let tx = tx.as_ref().unwrap();
+    fn send_delete(&self, key: K, value: Option<T>) {
+        if let Some((tx, value)) = self.inner.options.delete_tx.as_ref().zip(value) {
             let _ = tx.send((key, value));
         }
     }
 
-    async fn send_err(&self, key: FastStr, err: F::Error) {
-        let tx = self.inner.options.error_tx.clone();
-        if let Some(tx) = tx {
+    async fn send_error(&self, key: K, err: F::Error) {
+        if let Some(tx) = self.inner.options.error_tx.as_ref() {
             let _ = tx.send((key, err)).await;
         }
     }
 
-    async fn refresh(&self) {
-        let mut interval = tokio::time::interval(self.inner.options.refresh_interval);
+    async fn refresh(&self, refresh_interval: Duration) {
+        let mut interval = tokio::time::interval(refresh_interval);
 
         loop {
             interval.tick().await;
 
-            // first, get all keys
-            let keys: Vec<FastStr> = self
+            let mut futures = FuturesOrdered::new();
+
+            let keys: Vec<K> = self
                 .inner
                 .data
                 .iter()
-                .map(|kv_ref| kv_ref.key().clone())
+                .map(|entry| {
+                    // get all keys, fetch all data using the keys
+                    let key = entry.key();
+                    let fut = self.inner.options.fetcher.fetch(key.clone());
+                    futures.push_back(fut);
+                    key.clone()
+                })
                 .collect();
 
-            // after that, fetch all data using the keys
-            let mut futures = FuturesOrdered::new();
-            for k in &keys {
-                let fut = self.inner.options.fetcher.fetch(k.clone());
-                futures.push_back(fut);
-            }
+            debug_assert!(futures.len() == keys.len());
 
-            // and save them into a new vec
-            let mut new_data = Vec::with_capacity(futures.len());
-            assert!(futures.len() == keys.len());
-            let mut key_index = 0;
-            while let Some(res) = futures.next().await {
-                let key = unsafe { keys.get_unchecked(key_index) }.clone();
-                key_index += 1;
+            let mut key_iter = keys.into_iter();
+            while let Some((res, key)) = futures.next().await.zip(key_iter.next()) {
                 match res {
-                    Ok(v) => new_data.push(Some(v)),
-                    Err(e) => {
-                        self.send_err(key, e).await;
-                        new_data.push(None);
+                    Ok(val) => {
+                        self.inner.data.entry(key).and_modify(|entry| {
+                            entry.val.replace(val);
+                        });
                     }
-                }
-            }
-
-            // finally, replace the old data with the new one
-            for (k, v) in keys.into_iter().zip(new_data.into_iter()) {
-                if let Some(v) = v {
-                    if let Some(mut old) = self.inner.data.get_mut(&k) {
-                        old.val = v;
+                    Err(e) => {
+                        // only use key when meet error
+                        self.send_error(key, e).await;
                     }
                 }
             }
         }
     }
-    fn is_expiration_enabled(&self) -> bool {
-        self.inner.options.expire_interval.is_some()
-    }
 
-    async fn expire_cron(&self) {
-        let mut interval = tokio::time::interval(self.inner.options.expire_interval.unwrap());
+    async fn expire_cron(&self, expire_interval: Duration) {
+        let mut interval = tokio::time::interval(expire_interval);
 
-        let mut delete_keys = Vec::with_capacity(self.inner.data.len() / 2);
         loop {
             interval.tick().await;
 
-            delete_keys.clear();
-            for kv_ref in self.inner.data.iter() {
-                if kv_ref.value().expire.load(atomic::Ordering::Relaxed) {
-                    delete_keys.push(kv_ref.key().clone());
+            self.inner.data.retain(|key, entry| {
+                if entry.expire.load(atomic::Ordering::Relaxed) {
+                    // second round, delete expired data
+                    self.send_delete(key.clone(), entry.val.take());
+                    false
                 } else {
-                    // first round, mark as expired
-                    kv_ref.value().expire.store(true, atomic::Ordering::Relaxed);
+                    // first round, mark as expired, but don't delete
+                    entry.expire.store(true, atomic::Ordering::Relaxed);
+                    true
                 }
-            }
-
-            // second round, delete expired data
-            for k in delete_keys.iter() {
-                if let Some((_, ety)) = self.inner.data.remove(k) {
-                    self.send_delete(k.clone(), ety.val);
-                }
-            }
+            });
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::Options;
+    use super::*;
     use faststr::FastStr;
-    use std::convert::Infallible;
+    use std::sync::atomic::Ordering;
+    use std::{
+        convert::Infallible,
+        sync::{atomic::AtomicUsize, Arc},
+    };
 
     #[derive(Clone)]
-    struct TestFetcher;
+    struct TestFetcher(Arc<AtomicUsize>);
 
-    impl crate::Fetcher<usize> for TestFetcher {
+    impl Fetcher<FastStr, usize> for TestFetcher {
         type Error = Infallible;
         async fn fetch(&self, _: FastStr) -> Result<usize, Self::Error> {
             println!("fetching...");
+            self.0.fetch_add(1, Ordering::Relaxed);
             Ok(1)
         }
     }
 
     #[tokio::test]
     async fn it_works() {
-        let ac = Options::new(std::time::Duration::from_secs(5), TestFetcher).build();
-        let first_fetch = ac.get("123".into()).await;
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let ac = DefaultAsyncCache::builder(
+            std::time::Duration::from_secs(5),
+            TestFetcher(counter.clone()),
+        )
+        .build();
+
+        let first_fetch = ac.get(&"123".into()).await;
         assert_eq!(first_fetch.unwrap(), 1);
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
     async fn expire_works() {
-        // async behaviors: first fetch(0s), refresh (2s), expire(3s), refresh(4s), delete(6s)
-        // so, `println!("fetching...");` is expected to be called three times.
-        let expire_interval = std::time::Duration::from_secs(3);
-        let ac = Options::new(std::time::Duration::from_secs(2), TestFetcher)
-            .with_expire(Some(expire_interval))
-            .build();
-        let first_fetch = ac.get("123".into()).await;
+        // async behaviors:
+        //  - first fetch (0)
+        //  - refresh     (100ms)
+        //  - expire      (150ms)
+        //  - refresh     (200ms)
+        //  - delete      (300ms)
+        //
+        // so, `println!("fetching...");` is expected to be called 3 times.
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let expire_interval = std::time::Duration::from_millis(150);
+        let ac = DefaultAsyncCache::builder(
+            std::time::Duration::from_millis(100),
+            TestFetcher(counter.clone()),
+        )
+        .with_expire(Some(expire_interval))
+        .build();
+
+        let first_fetch = ac.get(&"123".into()).await;
         assert_eq!(first_fetch.unwrap(), 1);
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(counter.load(Ordering::Relaxed), 3);
     }
 }
