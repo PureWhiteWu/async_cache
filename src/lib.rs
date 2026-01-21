@@ -83,6 +83,7 @@ use async_singleflight::Group;
 use dashmap::DashMap;
 use futures::{prelude::*, stream::FuturesOrdered};
 use tokio::sync::{broadcast, mpsc};
+use tokio_util::sync::{CancellationToken, DropGuard};
 
 const DEFAULT_EXPIRE_DURATION: Duration = Duration::from_secs(180);
 const DEFAULT_CACHE_CAPACITY: usize = 16;
@@ -161,6 +162,8 @@ where
     {
         let expire_interval = self.expire_interval;
         let refresh_interval = self.refresh_interval;
+        let cancel = CancellationToken::new();
+        let done = Arc::new(cancel.clone().drop_guard());
 
         let cache = AsyncCache {
             inner: Arc::new(AsyncCacheInner {
@@ -171,18 +174,20 @@ where
                     error_tx: self.error_tx,
                     delete_tx: self.delete_tx,
                 },
+                cancel,
             }),
+            done,
         };
 
         {
-            let cache = cache.clone();
+            let cache = cache.inner.clone();
             tokio::spawn(async move {
                 cache.refresh(refresh_interval).await;
             });
         }
 
         if let Some(expire_interval) = expire_interval {
-            let cache = cache.clone();
+            let cache = cache.inner.clone();
             tokio::spawn(async move {
                 cache.expire_cron(expire_interval).await;
             });
@@ -210,6 +215,7 @@ where
     F: Fetcher<K, T> + Sync + Send + 'static,
 {
     inner: Arc<AsyncCacheInner<K, T, F, S>>,
+    done: Arc<DropGuard>,
 }
 
 impl<K, T, F, S> Clone for AsyncCache<K, T, F, S>
@@ -220,6 +226,7 @@ where
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
+            done: self.done.clone(),
         }
     }
 }
@@ -253,6 +260,94 @@ where
     options: AsyncCacheOptions<K, T, F>,
     sfg: Group<K, T, F::Error, S>,
     data: DashMap<K, Entry<T>, S>,
+    cancel: CancellationToken,
+}
+
+impl<K, T, F, S> AsyncCacheInner<K, T, F, S>
+where
+    K: Eq + Hash + Sync + Send + Clone,
+    F: Fetcher<K, T> + Sync + Send,
+    T: Send + Sync + Clone + 'static,
+    S: BuildHasher + Clone + 'static,
+{
+    async fn refresh(&self, refresh_interval: Duration) {
+        let mut interval = tokio::time::interval(refresh_interval);
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => break,
+                _ = interval.tick() => {
+                    let mut futures = FuturesOrdered::new();
+
+                    let keys: Vec<K> = self
+                        .data
+                        .iter()
+                        .map(|entry| {
+                            // get all keys, fetch all data using the keys
+                            let key = entry.key();
+                            let fut = self.options.fetcher.fetch(key.clone());
+                            futures.push_back(fut);
+                            key.clone()
+                        })
+                        .collect();
+
+                    debug_assert!(futures.len() == keys.len());
+
+                    let mut key_iter = keys.into_iter();
+                    while let Some((res, key)) = futures.next().await.zip(key_iter.next()) {
+                        match res {
+                            Ok(val) => {
+                                self.data.entry(key).and_modify(|entry| {
+                                    entry.val.replace(val);
+                                });
+                            }
+                            Err(e) => {
+                                // only use key when meet error
+                                self.send_error(key, e).await;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn expire_cron(&self, expire_interval: Duration) {
+        let mut interval = tokio::time::interval(expire_interval);
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => break,
+                _ = interval.tick() => {
+                    self.data.retain(|key, entry| {
+                        if entry.expire.load(atomic::Ordering::Relaxed) {
+                            // second round, delete expired data
+                            self.send_delete(key.clone(), entry.val.take());
+                            false
+                        } else {
+                            // first round, mark as expired, but don't delete
+                            entry.expire.store(true, atomic::Ordering::Relaxed);
+                            true
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    fn send_delete(&self, key: K, value: Option<T>) {
+        if let Some((tx, value)) = self.options.delete_tx.as_ref().zip(value) {
+            let _ = tx.send((key, value));
+        }
+    }
+
+    async fn send_error(&self, key: K, err: F::Error) {
+        if let Some(tx) = self.options.error_tx.as_ref() {
+            let _ = tx.send((key, err)).await;
+        }
+    }
 }
 
 impl<K, T, F, S> AsyncCache<K, T, F, S>
@@ -298,7 +393,7 @@ where
                 Some(value)
             }
             Err(Some(err)) => {
-                self.send_error(key.clone(), err).await;
+                self.inner.send_error(key.clone(), err).await;
                 None
             }
             Err(None) => None,
@@ -327,82 +422,10 @@ where
             if prediction(key, entry.val.as_mut().unwrap()) {
                 true
             } else {
-                self.send_delete(key.clone(), entry.val.take());
+                self.inner.send_delete(key.clone(), entry.val.take());
                 false
             }
         });
-    }
-
-    fn send_delete(&self, key: K, value: Option<T>) {
-        if let Some((tx, value)) = self.inner.options.delete_tx.as_ref().zip(value) {
-            let _ = tx.send((key, value));
-        }
-    }
-
-    async fn send_error(&self, key: K, err: F::Error) {
-        if let Some(tx) = self.inner.options.error_tx.as_ref() {
-            let _ = tx.send((key, err)).await;
-        }
-    }
-
-    async fn refresh(&self, refresh_interval: Duration) {
-        let mut interval = tokio::time::interval(refresh_interval);
-
-        loop {
-            interval.tick().await;
-
-            let mut futures = FuturesOrdered::new();
-
-            let keys: Vec<K> = self
-                .inner
-                .data
-                .iter()
-                .map(|entry| {
-                    // get all keys, fetch all data using the keys
-                    let key = entry.key();
-                    let fut = self.inner.options.fetcher.fetch(key.clone());
-                    futures.push_back(fut);
-                    key.clone()
-                })
-                .collect();
-
-            debug_assert!(futures.len() == keys.len());
-
-            let mut key_iter = keys.into_iter();
-            while let Some((res, key)) = futures.next().await.zip(key_iter.next()) {
-                match res {
-                    Ok(val) => {
-                        self.inner.data.entry(key).and_modify(|entry| {
-                            entry.val.replace(val);
-                        });
-                    }
-                    Err(e) => {
-                        // only use key when meet error
-                        self.send_error(key, e).await;
-                    }
-                }
-            }
-        }
-    }
-
-    async fn expire_cron(&self, expire_interval: Duration) {
-        let mut interval = tokio::time::interval(expire_interval);
-
-        loop {
-            interval.tick().await;
-
-            self.inner.data.retain(|key, entry| {
-                if entry.expire.load(atomic::Ordering::Relaxed) {
-                    // second round, delete expired data
-                    self.send_delete(key.clone(), entry.val.take());
-                    false
-                } else {
-                    // first round, mark as expired, but don't delete
-                    entry.expire.store(true, atomic::Ordering::Relaxed);
-                    true
-                }
-            });
-        }
     }
 }
 
@@ -468,5 +491,27 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         assert_eq!(counter.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn bg_tasks_cancelled_on_drop() {
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let ac = DefaultAsyncCache::builder(
+            std::time::Duration::from_millis(100),
+            TestFetcher(counter.clone()),
+        )
+        .with_expire(None)
+        .build();
+
+        let first_fetch = ac.get(&"123".into()).await;
+        assert_eq!(first_fetch.unwrap(), 1);
+
+        // tasks are cancelled on drop
+        drop(ac);
+
+        // Without cancellation, more refreshes would happen during this sleep
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
 }
